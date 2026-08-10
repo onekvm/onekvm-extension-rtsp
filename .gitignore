@@ -1,0 +1,21 @@
+# CMake and Go build output
+/build/
+/cmake-build-*/
+/onekvm-protocol-rtsp
+/compile_commands.json
+/coverage.out
+
+# Rendered/package output
+/manifest.json
+*.ipk
+*.ipks
+
+# Python tool caches
+__pycache__/
+*.py[cod]
+
+# Local editor and OS files
+.DS_Store
+*.swp
+*.swo
+*~

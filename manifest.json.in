@@ -1,0 +1,76 @@
+{
+  "manifest_version": 1,
+  "id": "rtsp",
+  "i18n": {
+    "default": {
+      "name": "RTSP",
+      "description": "H.264 and H.265 network streaming for media players and recorder integrations, with configurable access control."
+    },
+    "zh": {
+      "name": "RTSP",
+      "description": "为媒体播放器和录像系统提供 H.264/H.265 网络视频流，并支持可配置的访问控制。"
+    },
+    "zh-TW": {
+      "name": "RTSP",
+      "description": "為媒體播放器和錄影系統提供 H.264/H.265 網路視訊串流，並支援可設定的存取控制。"
+    }
+  },
+  "version": "@VERSION@",
+  "api_version": 2,
+  "architecture": "@ARCH@",
+  "kind": "protocol",
+  "author": "OneKVM",
+  "homepage": "https://github.com/onekvm/onekvm-extension-rtsp",
+  "entrypoint": "bin/onekvm-protocol-rtsp",
+  "permissions": ["network"],
+  "capabilities": ["video.encoded"],
+  "video": {"settings": "all", "mode_select": ["h264", "h265"]},
+  "services": [{
+    "id": "server",
+    "i18n": {
+      "default": {"name": "RTSP server", "description": "H.264 and H.265 network streaming service."},
+      "zh": {"name": "RTSP 服务", "description": "提供 H.264 和 H.265 网络视频流。"},
+      "zh-TW": {"name": "RTSP 服務", "description": "提供 H.264 和 H.265 網路視訊串流。"}
+    }
+  }],
+  "icon": {"source": "lucide", "name": "radio-tower"},
+  "page": {
+    "title": "RTSP",
+    "renderer": "layout",
+    "entrypoint": "web/page.json"
+  },
+  "lifecycle": {
+    "enable": ["bin/onekvm-protocol-rtsp", "--lifecycle", "enable"],
+    "disable": ["bin/onekvm-protocol-rtsp", "--lifecycle", "disable"]
+  },
+  "settings_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["service_enabled", "listen_address", "port", "path", "access_control_enabled", "username", "password", "codec", "fps", "quality_factor", "bitrate_kbps", "initial_qp", "min_qp", "max_qp", "gop"],
+    "properties": {
+      "service_enabled": {"type": "boolean", "title": "RTSP server", "i18n": {"default": "RTSP server", "zh": "RTSP 服务", "zh-TW": "RTSP 服務"}, "default": true},
+      "listen_address": {"type": "string", "title": "Bind interface", "i18n": {"default": "Bind interface", "zh": "绑定接口", "zh-TW": "綁定介面"}, "format": "network-address", "default": "127.0.0.1", "maxLength": 64},
+      "port": {"type": "integer", "title": "Port", "i18n": {"default": "Port", "zh": "端口", "zh-TW": "連接埠"}, "default": 8554, "minimum": 1, "maximum": 65535},
+      "path": {"type": "string", "title": "Path", "i18n": {"default": "Path", "zh": "路径", "zh-TW": "路徑"}, "format": "path", "default": "/onekvm", "maxLength": 128},
+      "codec": {"type": "string", "title": "Video mode", "i18n": {"default": "Video mode", "zh": "视频模式", "zh-TW": "視訊模式"}, "enum": ["h264", "h265"], "default": "h264"},
+      "fps": {"type": "integer", "title": "Frame rate", "i18n": {"default": "Frame rate", "zh": "帧率", "zh-TW": "影格率"}, "default": 60, "minimum": 1, "maximum": 60},
+      "quality_factor": {"type": "number", "title": "Quality budget", "i18n": {"default": "Quality budget", "zh": "画质预算", "zh-TW": "畫質預算"}, "default": 1.0, "minimum": 0.1, "maximum": 1.0},
+      "bitrate_kbps": {"type": "integer", "title": "Maximum bitrate (kbps)", "i18n": {"default": "Maximum bitrate (kbps)", "zh": "最大码率 (kbps)", "zh-TW": "最大位元率 (kbps)"}, "default": 0, "minimum": 0, "maximum": 10000},
+      "initial_qp": {"type": "integer", "title": "Initial QP", "i18n": {"default": "Initial QP", "zh": "初始 QP", "zh-TW": "初始 QP"}, "default": 0, "minimum": 0, "maximum": 51},
+      "min_qp": {"type": "integer", "title": "Minimum QP", "i18n": {"default": "Minimum QP", "zh": "最小 QP", "zh-TW": "最小 QP"}, "default": 0, "minimum": 0, "maximum": 51},
+      "max_qp": {"type": "integer", "title": "Maximum QP", "i18n": {"default": "Maximum QP", "zh": "最大 QP", "zh-TW": "最大 QP"}, "default": 0, "minimum": 0, "maximum": 51},
+      "gop": {"type": "integer", "title": "Keyframe interval", "i18n": {"default": "Keyframe interval", "zh": "关键帧间隔", "zh-TW": "關鍵影格間隔"}, "default": 0, "minimum": 0, "maximum": 600},
+      "access_control_enabled": {"type": "boolean", "title": "Require credentials", "i18n": {"default": "Require credentials", "zh": "启用访问鉴权", "zh-TW": "要求登入憑證"}, "default": false},
+      "username": {"type": "string", "title": "Username", "i18n": {"default": "Username", "zh": "用户名", "zh-TW": "使用者名稱"}, "default": "", "maxLength": 128, "enabled_when": {"field": "access_control_enabled", "equals": true}, "required_when": {"field": "access_control_enabled", "equals": true}},
+      "password": {"type": "string", "title": "Password", "i18n": {"default": "Password", "zh": "密码", "zh-TW": "密碼"}, "format": "password", "default": "", "maxLength": 256, "enabled_when": {"field": "access_control_enabled", "equals": true}, "required_when": {"field": "access_control_enabled", "equals": true}}
+    }
+  },
+  "secret_fields": ["/password"],
+  "memory_budget": "4M",
+  "resource_limits": {"memory_max": "24M", "cpu_quota": "25%", "tasks_max": 32, "limit_nofile": 128},
+  "healthcheck": {
+    "type": "exec",
+    "command": ["bin/onekvm-protocol-rtsp", "--health"],
+    "timeout_seconds": 5
+  }
+}
