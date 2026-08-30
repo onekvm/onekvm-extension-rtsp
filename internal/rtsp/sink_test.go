@@ -3,6 +3,7 @@ package rtsp
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -35,6 +36,30 @@ func TestValidateConfigAllowsOptionalCredentials(t *testing.T) {
 	base.Codec = "mjpeg"
 	if err := ValidateConfig(base); err == nil || !strings.Contains(err.Error(), "H.264 or H.265") {
 		t.Fatalf("unsupported codec error = %v", err)
+	}
+}
+
+func TestRTSPDescribeAdvertisesSharedOpus(t *testing.T) {
+	port := availablePort(t)
+	sink := NewSink(Config{ListenAddress: "127.0.0.1", Port: port, Path: "/onekvm", Codec: "h264"})
+	if err := sink.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Stop()
+
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_, err = fmt.Fprintf(conn, "DESCRIBE rtsp://127.0.0.1:%d/onekvm RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n", port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(bufio.NewReader(conn))
+	if !strings.Contains(string(body), "opus/48000/2") {
+		t.Fatalf("SDP missing shared Opus audio:\n%s", body)
 	}
 }
 

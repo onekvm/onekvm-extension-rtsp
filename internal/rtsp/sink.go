@@ -11,6 +11,7 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
+	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpsimpleaudio"
 	"github.com/bluenviron/gortsplib/v5/pkg/liberrors"
 	"github.com/pion/rtp"
 
@@ -33,15 +34,18 @@ type rtpEncoder interface {
 
 // Sink exposes the already encoded pipeline output through RTSP.
 type Sink struct {
-	mu        sync.Mutex
-	cfg       Config
-	server    *gortsplib.Server
-	stream    *gortsplib.ServerStream
-	media     *description.Media
-	encoder   rtpEncoder
-	started   bool
-	timestamp uint32
-	readers   map[*gortsplib.ServerSession]struct{}
+	mu           sync.Mutex
+	cfg          Config
+	server       *gortsplib.Server
+	stream       *gortsplib.ServerStream
+	media        *description.Media
+	audioMedia   *description.Media
+	encoder      rtpEncoder
+	audioEncoder *rtpsimpleaudio.Encoder
+	started      bool
+	timestamp    uint32
+	audioTS      uint32
+	readers      map[*gortsplib.ServerSession]struct{}
 }
 
 func NewSink(cfg Config) *Sink {
@@ -80,6 +84,15 @@ func (s *Sink) Start() error {
 		Type:    description.MediaTypeVideo,
 		Formats: []format.Format{videoFormat},
 	}
+	opusFormat := &format.Opus{PayloadTyp: 111, ChannelCount: 2}
+	audioEncoder, err := opusFormat.CreateEncoder()
+	if err != nil {
+		return fmt.Errorf("initialize Opus RTP encoder: %w", err)
+	}
+	s.audioMedia = &description.Media{
+		Type:    description.MediaTypeAudio,
+		Formats: []format.Format{opusFormat},
+	}
 	s.server = &gortsplib.Server{
 		Handler:     s,
 		RTSPAddress: net.JoinHostPort(s.cfg.ListenAddress, fmt.Sprint(s.cfg.Port)),
@@ -90,7 +103,7 @@ func (s *Sink) Start() error {
 	}
 	s.stream = &gortsplib.ServerStream{
 		Server: s.server,
-		Desc:   &description.Session{Medias: []*description.Media{s.media}},
+		Desc:   &description.Session{Medias: []*description.Media{s.media, s.audioMedia}},
 	}
 	if err := s.stream.Initialize(); err != nil {
 		s.server.Close()
@@ -99,6 +112,7 @@ func (s *Sink) Start() error {
 		return fmt.Errorf("initialize RTSP stream: %w", err)
 	}
 	s.encoder = encoder
+	s.audioEncoder = audioEncoder
 	s.started = true
 	return nil
 }
@@ -133,7 +147,9 @@ func (s *Sink) Stop() error {
 	s.stream = nil
 	s.server = nil
 	s.encoder = nil
+	s.audioEncoder = nil
 	s.media = nil
+	s.audioMedia = nil
 	s.readers = make(map[*gortsplib.ServerSession]struct{})
 	s.mu.Unlock()
 	if hadReaders && demandChange != nil {
@@ -175,7 +191,23 @@ func (s *Sink) WriteVideo(payload []byte, duration float64) error {
 	return nil
 }
 
-func (*Sink) WriteAudio([]byte, float64) error { return nil }
+func (s *Sink) WriteAudio(payload []byte, duration float64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.started || s.stream == nil || s.audioEncoder == nil || s.audioMedia == nil || len(s.readers) == 0 {
+		return nil
+	}
+	packet, err := s.audioEncoder.Encode(payload)
+	if err != nil {
+		return fmt.Errorf("packetize RTSP audio: %w", err)
+	}
+	if duration <= 0 || duration > 1 {
+		duration = 0.02
+	}
+	s.audioTS += uint32(duration * 48000)
+	packet.Timestamp = s.audioTS
+	return s.stream.WritePacketRTP(s.audioMedia, packet)
+}
 
 func (*Sink) OnControlMessage(func(av.ControlMsg)) {}
 

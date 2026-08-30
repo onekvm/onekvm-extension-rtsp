@@ -6,6 +6,7 @@
 #include <H264VideoStreamDiscreteFramer.hh>
 #include <H265VideoRTPSink.hh>
 #include <H265VideoStreamDiscreteFramer.hh>
+#include <SimpleRTPSink.hh>
 #include <liveMedia.hh>
 
 #include <arpa/inet.h>
@@ -29,7 +30,9 @@ namespace onekvm::rtsp {
 namespace {
 
 constexpr std::size_t kMaxQueuedAccessUnits = 2;
+constexpr std::size_t kMaxQueuedAudioPackets = 8;
 constexpr unsigned kEstimatedBitrateKbps = 20000;
+constexpr unsigned kEstimatedAudioBitrateKbps = 128;
 constexpr unsigned kAuxSDPChecks = 30;
 
 std::string ClientAddress(const sockaddr_storage &address) {
@@ -204,45 +207,186 @@ BoundRTSPServer::createNewClientSession(u_int32_t session_id) {
   return new TrackedRTSPClientSession(*this, session_id);
 }
 
-class QueueSource final : public FramedSource {
+class EncodedHub {
 public:
-  static QueueSource *Create(UsageEnvironment &env, const Config &config,
-                             const Identity &identity, Codec codec,
-                             std::atomic<bool> &fatal,
-                             std::string &fatal_error) {
-    return new QueueSource(env, config, identity, codec, fatal, fatal_error);
-  }
-
-  bool LastNalEndsAccessUnit() const { return last_nal_ends_access_unit_; }
-
-  void RequestKeyFrame() { subscription_->RequestKeyFrame(); }
-
-protected:
-  QueueSource(UsageEnvironment &env, const Config &config,
-              const Identity &identity, Codec codec, std::atomic<bool> &fatal,
-              std::string &fatal_error)
-      : FramedSource(env), fatal_(fatal), fatal_error_(fatal_error) {
-    event_trigger_ = envir().taskScheduler().createEventTrigger(DeliverFrame0);
+  EncodedHub(const Config &config, const Identity &identity, Codec codec,
+             std::atomic<bool> &fatal, std::string &fatal_error)
+      : fatal_(fatal), fatal_error_(fatal_error) {
     const VideoProfile profile{codec, config.fps, config.quality_factor,
                                config.bitrate_kbps, config.initial_qp,
                                config.min_qp, config.max_qp, config.gop};
     subscription_ = std::make_unique<MediaSubscription>(
         config.media_socket, identity, profile,
-        [this](std::vector<NalPacket> packets) { Enqueue(std::move(packets)); },
-        [this]() {
-          envir().taskScheduler().triggerEvent(event_trigger_, this);
-        },
+        [this](std::vector<NalPacket> packets) { EnqueueVideo(std::move(packets)); },
+        [this](NalPacket packet) { EnqueueAudio(std::move(packet)); },
+        [this]() { Notify(); },
         [this](std::string message) {
           fatal_error_ = std::move(message);
           fatal_.store(true);
           kill(getpid(), SIGTERM);
         });
-    subscription_->Start();
+  }
+
+  EncodedHub(const EncodedHub &) = delete;
+  EncodedHub &operator=(const EncodedHub &) = delete;
+
+  ~EncodedHub() { subscription_->Stop(); }
+
+  void Retain() {
+    bool start = false;
+    {
+      std::lock_guard lock(mutex_);
+      start = refs_++ == 0;
+    }
+    if (start)
+      subscription_->Start();
+  }
+
+  void Release() {
+    bool stop = false;
+    {
+      std::lock_guard lock(mutex_);
+      if (refs_ > 0)
+        stop = --refs_ == 0;
+      if (stop) {
+        video_.clear();
+        audio_.clear();
+        queued_access_units_ = 0;
+      }
+    }
+    if (stop)
+      subscription_->Stop();
+  }
+
+  void BindVideo(UsageEnvironment *env, EventTriggerId trigger, void *client) {
+    std::lock_guard lock(mutex_);
+    video_env_ = env;
+    video_trigger_ = trigger;
+    video_client_ = client;
+  }
+
+  void ClearVideo() {
+    std::lock_guard lock(mutex_);
+    video_env_ = nullptr;
+    video_trigger_ = 0;
+    video_client_ = nullptr;
+  }
+
+  void BindAudio(UsageEnvironment *env, EventTriggerId trigger, void *client) {
+    std::lock_guard lock(mutex_);
+    audio_env_ = env;
+    audio_trigger_ = trigger;
+    audio_client_ = client;
+  }
+
+  void ClearAudio() {
+    std::lock_guard lock(mutex_);
+    audio_env_ = nullptr;
+    audio_trigger_ = 0;
+    audio_client_ = nullptr;
+  }
+
+  bool PopVideo(NalPacket &packet) {
+    std::lock_guard lock(mutex_);
+    if (video_.empty())
+      return false;
+    packet = std::move(video_.front());
+    video_.pop_front();
+    if (packet.end_access_unit && queued_access_units_ > 0)
+      --queued_access_units_;
+    return true;
+  }
+
+  bool PopAudio(NalPacket &packet) {
+    std::lock_guard lock(mutex_);
+    if (audio_.empty())
+      return false;
+    packet = std::move(audio_.front());
+    audio_.pop_front();
+    return true;
+  }
+
+  void RequestKeyFrame() { subscription_->RequestKeyFrame(); }
+
+private:
+  void Notify() {
+    std::lock_guard lock(mutex_);
+    if (video_env_ != nullptr)
+      video_env_->taskScheduler().triggerEvent(video_trigger_, video_client_);
+    if (audio_env_ != nullptr)
+      audio_env_->taskScheduler().triggerEvent(audio_trigger_, audio_client_);
+  }
+
+  void EnqueueVideo(std::vector<NalPacket> packets) {
+    if (packets.empty())
+      return;
+    std::lock_guard lock(mutex_);
+    const bool keyframe = packets.front().keyframe;
+    if (keyframe) {
+      video_.clear();
+      queued_access_units_ = 0;
+    } else if (queued_access_units_ >= kMaxQueuedAccessUnits &&
+               !video_.empty() && video_.front().keyframe) {
+      return;
+    }
+    while (queued_access_units_ >= kMaxQueuedAccessUnits && !video_.empty()) {
+      const bool end = video_.front().end_access_unit;
+      video_.pop_front();
+      if (end)
+        --queued_access_units_;
+    }
+    for (auto &packet : packets)
+      video_.push_back(std::move(packet));
+    ++queued_access_units_;
+  }
+
+  void EnqueueAudio(NalPacket packet) {
+    if (packet.data == nullptr || packet.size == 0)
+      return;
+    std::lock_guard lock(mutex_);
+    while (audio_.size() >= kMaxQueuedAudioPackets)
+      audio_.pop_front();
+    audio_.push_back(std::move(packet));
+  }
+
+  std::atomic<bool> &fatal_;
+  std::string &fatal_error_;
+  std::unique_ptr<MediaSubscription> subscription_;
+  std::mutex mutex_;
+  int refs_ = 0;
+  std::deque<NalPacket> video_;
+  std::deque<NalPacket> audio_;
+  std::size_t queued_access_units_ = 0;
+  UsageEnvironment *video_env_ = nullptr;
+  EventTriggerId video_trigger_ = 0;
+  void *video_client_ = nullptr;
+  UsageEnvironment *audio_env_ = nullptr;
+  EventTriggerId audio_trigger_ = 0;
+  void *audio_client_ = nullptr;
+};
+
+class QueueSource final : public FramedSource {
+public:
+  static QueueSource *Create(UsageEnvironment &env, EncodedHub &hub) {
+    return new QueueSource(env, hub);
+  }
+
+  bool LastNalEndsAccessUnit() const { return last_nal_ends_access_unit_; }
+
+  void RequestKeyFrame() { hub_.RequestKeyFrame(); }
+
+protected:
+  QueueSource(UsageEnvironment &env, EncodedHub &hub)
+      : FramedSource(env), hub_(hub) {
+    event_trigger_ = envir().taskScheduler().createEventTrigger(DeliverFrame0);
+    hub_.BindVideo(&envir(), event_trigger_, this);
+    hub_.Retain();
   }
 
   ~QueueSource() override {
-    subscription_->Stop();
+    hub_.ClearVideo();
     envir().taskScheduler().deleteEventTrigger(event_trigger_);
+    hub_.Release();
   }
 
 private:
@@ -252,46 +396,12 @@ private:
 
   void doGetNextFrame() override { DeliverFrame(); }
 
-  void Enqueue(std::vector<NalPacket> packets) {
-    if (packets.empty())
-      return;
-    std::lock_guard lock(mutex_);
-    const bool keyframe = packets.front().keyframe;
-    if (keyframe) {
-      // A new random-access point supersedes every queued access unit. Keeping
-      // stale P frames ahead of it only delays decoder recovery.
-      queue_.clear();
-      queued_access_units_ = 0;
-    } else if (queued_access_units_ >= kMaxQueuedAccessUnits &&
-               !queue_.empty() && queue_.front().keyframe) {
-      // Do not let producer-side P frames evict an IDR while LIVE555 is still
-      // packetizing it (or while DESCRIBE/SETUP has not reached PLAY yet).
-      return;
-    }
-    while (queued_access_units_ >= kMaxQueuedAccessUnits && !queue_.empty()) {
-      const bool end = queue_.front().end_access_unit;
-      queue_.pop_front();
-      if (end)
-        --queued_access_units_;
-    }
-    for (auto &packet : packets)
-      queue_.push_back(std::move(packet));
-    ++queued_access_units_;
-  }
-
   void DeliverFrame() {
     if (!isCurrentlyAwaitingData())
       return;
     NalPacket packet;
-    {
-      std::lock_guard lock(mutex_);
-      if (queue_.empty())
-        return;
-      packet = std::move(queue_.front());
-      queue_.pop_front();
-      if (packet.end_access_unit)
-        --queued_access_units_;
-    }
+    if (!hub_.PopVideo(packet))
+      return;
     fFrameSize = static_cast<unsigned>(
         std::min<std::size_t>(packet.size, fMaxSize));
     fNumTruncatedBytes = static_cast<unsigned>(packet.size - fFrameSize);
@@ -303,14 +413,56 @@ private:
     FramedSource::afterGetting(this);
   }
 
-  std::atomic<bool> &fatal_;
-  std::string &fatal_error_;
+  EncodedHub &hub_;
   EventTriggerId event_trigger_ = 0;
-  std::unique_ptr<MediaSubscription> subscription_;
-  std::mutex mutex_;
-  std::deque<NalPacket> queue_;
-  std::size_t queued_access_units_ = 0;
   bool last_nal_ends_access_unit_ = false;
+};
+
+class OpusSource final : public FramedSource {
+public:
+  static OpusSource *Create(UsageEnvironment &env, EncodedHub &hub) {
+    return new OpusSource(env, hub);
+  }
+
+protected:
+  OpusSource(UsageEnvironment &env, EncodedHub &hub)
+      : FramedSource(env), hub_(hub) {
+    event_trigger_ = envir().taskScheduler().createEventTrigger(DeliverFrame0);
+    hub_.BindAudio(&envir(), event_trigger_, this);
+    hub_.Retain();
+  }
+
+  ~OpusSource() override {
+    hub_.ClearAudio();
+    envir().taskScheduler().deleteEventTrigger(event_trigger_);
+    hub_.Release();
+  }
+
+private:
+  static void DeliverFrame0(void *client_data) {
+    static_cast<OpusSource *>(client_data)->DeliverFrame();
+  }
+
+  void doGetNextFrame() override { DeliverFrame(); }
+
+  void DeliverFrame() {
+    if (!isCurrentlyAwaitingData())
+      return;
+    NalPacket packet;
+    if (!hub_.PopAudio(packet))
+      return;
+    fFrameSize = static_cast<unsigned>(
+        std::min<std::size_t>(packet.size, fMaxSize));
+    fNumTruncatedBytes = static_cast<unsigned>(packet.size - fFrameSize);
+    std::memcpy(fTo, packet.data, fFrameSize);
+    gettimeofday(&fPresentationTime, nullptr);
+    fDurationInMicroseconds =
+        packet.duration_us == 0 ? 20000 : packet.duration_us;
+    FramedSource::afterGetting(this);
+  }
+
+  EncodedHub &hub_;
+  EventTriggerId event_trigger_ = 0;
 };
 
 class H264AccessUnitFramer final : public H264VideoStreamDiscreteFramer {
@@ -359,29 +511,21 @@ private:
 
 class OneKVMSubsession final : public OnDemandServerMediaSubsession {
 public:
-  static OneKVMSubsession *Create(UsageEnvironment &env, const Config &config,
-                                  const Identity &identity, Codec codec,
-                                  std::atomic<bool> &fatal,
-                                  std::string &fatal_error) {
-    return new OneKVMSubsession(env, config, identity, codec, fatal,
-                                fatal_error);
+  static OneKVMSubsession *Create(UsageEnvironment &env, Codec codec,
+                                  EncodedHub &hub) {
+    return new OneKVMSubsession(env, codec, hub);
   }
 
 protected:
-  OneKVMSubsession(UsageEnvironment &env, const Config &config,
-                   const Identity &identity, Codec codec,
-                   std::atomic<bool> &fatal, std::string &fatal_error)
-      : OnDemandServerMediaSubsession(env, True), config_(config),
-        identity_(identity), codec_(codec), fatal_(fatal),
-        fatal_error_(fatal_error) {}
+  OneKVMSubsession(UsageEnvironment &env, Codec codec, EncodedHub &hub)
+      : OnDemandServerMediaSubsession(env, True), codec_(codec), hub_(hub) {}
 
   ~OneKVMSubsession() override { delete[] aux_sdp_line_; }
 
   FramedSource *createNewStreamSource(unsigned,
                                       unsigned &estimated_bitrate) override {
     estimated_bitrate = kEstimatedBitrateKbps;
-    auto *source = QueueSource::Create(envir(), config_, identity_, codec_,
-                                       fatal_, fatal_error_);
+    auto *source = QueueSource::Create(envir(), hub_);
     if (codec_ == Codec::kH264)
       return H264AccessUnitFramer::Create(envir(), source);
     return H265AccessUnitFramer::Create(envir(), source);
@@ -456,15 +600,38 @@ private:
     }
   }
 
-  Config config_;
-  Identity identity_;
   Codec codec_;
-  std::atomic<bool> &fatal_;
-  std::string &fatal_error_;
+  EncodedHub &hub_;
   char *aux_sdp_line_ = nullptr;
   char done_flag_ = 0;
   RTPSink *dummy_sink_ = nullptr;
   unsigned checks_remaining_ = 0;
+};
+
+class OneKVMAudioSubsession final : public OnDemandServerMediaSubsession {
+public:
+  static OneKVMAudioSubsession *Create(UsageEnvironment &env, EncodedHub &hub) {
+    return new OneKVMAudioSubsession(env, hub);
+  }
+
+protected:
+  OneKVMAudioSubsession(UsageEnvironment &env, EncodedHub &hub)
+      : OnDemandServerMediaSubsession(env, True), hub_(hub) {}
+
+  FramedSource *createNewStreamSource(unsigned,
+                                      unsigned &estimated_bitrate) override {
+    estimated_bitrate = kEstimatedAudioBitrateKbps;
+    return OpusSource::Create(envir(), hub_);
+  }
+
+  RTPSink *createNewRTPSink(Groupsock *groupsock, unsigned char payload_type,
+                            FramedSource *) override {
+    return SimpleRTPSink::createNew(envir(), groupsock, payload_type, 48000,
+                                    "audio", "OPUS", 2, False);
+  }
+
+private:
+  EncodedHub &hub_;
 };
 
 } // namespace
@@ -500,11 +667,12 @@ bool RunRTSPServer(const Config &config, const Identity &identity, Codec codec,
   std::string stream_name = config.path;
   while (!stream_name.empty() && stream_name.front() == '/')
     stream_name.erase(0, 1);
+  EncodedHub hub(config, identity, codec, fatal, fatal_error);
   auto *session =
       ServerMediaSession::createNew(*environment, stream_name.c_str(),
-                                    stream_name.c_str(), "OneKVM video stream");
-  session->addSubsession(OneKVMSubsession::Create(
-      *environment, config, identity, codec, fatal, fatal_error));
+                                    stream_name.c_str(), "OneKVM");
+  session->addSubsession(OneKVMSubsession::Create(*environment, codec, hub));
+  session->addSubsession(OneKVMAudioSubsession::Create(*environment, hub));
   server->addServerMediaSession(session);
   OutPacketBuffer::maxSize = 2U << 20;
 

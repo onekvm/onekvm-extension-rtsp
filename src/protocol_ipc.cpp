@@ -105,7 +105,7 @@ struct RingLease {
   }
 };
 
-bool IsCodec(std::uint8_t value) { return value >= 1 && value <= 3; }
+bool IsCodec(std::uint8_t value) { return value >= 1 && value <= 4; }
 
 bool WriteAll(int fd, std::string_view data, std::string &error) {
   while (!data.empty()) {
@@ -211,6 +211,8 @@ std::string SubscriptionJSON(const Identity &identity, std::string_view video,
         request += ",\"gop\":" + std::to_string(profile->gop);
     }
   }
+  if (video == "encoded")
+    request += ",\"audio\":\"opus\"";
   if (shared_ring)
     request += ",\"transport\":\"shm-ring-v1\"";
   if (!track_session)
@@ -393,17 +395,19 @@ Frame TakeNextFrame(const std::shared_ptr<RingMapping> &ring) {
     const auto payload_size = ReadLE32(header + 4);
     const auto width = ReadLE16(header + 28);
     const auto height = ReadLE16(header + 30);
-    if (payload_size == 0 || payload_size > ring->slot_capacity || width == 0 ||
-        height == 0 || !IsCodec(header[32])) {
+    const auto codec = static_cast<Codec>(header[32]);
+    const bool audio = codec == Codec::kOpus;
+    if (payload_size == 0 || payload_size > ring->slot_capacity ||
+        !IsCodec(header[32]) || (!audio && (width == 0 || height == 0))) {
       __atomic_store_n(selected_state, kRingStateFree, __ATOMIC_RELEASE);
       return {};
     }
     auto lease = std::make_shared<RingLease>();
     lease->ring = ring;
     lease->state = selected_state;
-    return Frame{ReadLE64(header + 8), static_cast<Codec>(header[32]),
-                 ReadLE32(header + 24), width, height, header[33] != 0, lease,
-                 header + kRingSlotHeaderSize, payload_size};
+    return Frame{ReadLE64(header + 8), codec, ReadLE32(header + 24), width,
+                 height, header[33] != 0, lease, header + kRingSlotHeaderSize,
+                 payload_size};
   }
   return {};
 }
@@ -562,6 +566,8 @@ const char *CodecName(Codec codec) {
     return "h265";
   case Codec::kMJPEG:
     return "mjpeg";
+  case Codec::kOpus:
+    return "opus";
   }
   return "unknown";
 }
@@ -592,10 +598,12 @@ SessionReporter::~SessionReporter() {
 MediaSubscription::MediaSubscription(std::string socket_path, Identity identity,
                                      VideoProfile profile,
                                      FrameCallback frame_callback,
+                                     AudioCallback audio_callback,
                                      NotifyCallback notify_callback,
                                      FatalCallback fatal_callback)
     : socket_path_(std::move(socket_path)), identity_(std::move(identity)),
       profile_(profile), frame_callback_(std::move(frame_callback)),
+      audio_callback_(std::move(audio_callback)),
       notify_callback_(std::move(notify_callback)),
       fatal_callback_(std::move(fatal_callback)) {}
 
@@ -683,19 +691,31 @@ void MediaSubscription::Run() {
           // iteration drains them in order before sleeping again.
           continue;
         }
+      } else if (!ReadFrame(fd, frame, error)) {
+        break;
+      }
+      if (frame.codec == Codec::kOpus) {
+        if (audio_callback_) {
+          auto copy = std::make_shared<std::vector<std::uint8_t>>(
+              frame.data, frame.data + frame.size);
+          audio_callback_({copy, copy->data(), copy->size(), frame.duration_us,
+                           true, false});
+          notify_callback_();
+        }
+        continue;
+      }
+      if (ring != nullptr) {
         if (last_sequence != 0 && frame.sequence != last_sequence + 1) {
           waiting_for_keyframe = true;
           if (!frame.keyframe)
             (void)WriteAll(fd, "{\"request\":\"keyframe\"}\n", error);
         }
         last_sequence = frame.sequence;
-        if (waiting_for_keyframe) {
-          if (!frame.keyframe)
-            continue;
-          waiting_for_keyframe = false;
-        }
-      } else if (!ReadFrame(fd, frame, error)) {
-        break;
+      }
+      if (waiting_for_keyframe) {
+        if (!frame.keyframe)
+          continue;
+        waiting_for_keyframe = false;
       }
       if (frame.codec != profile_.codec) {
         fatal_callback_(std::string("independent video codec changed from ") +

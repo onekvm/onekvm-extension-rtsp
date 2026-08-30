@@ -11,7 +11,7 @@
 
 namespace onekvm::rtsp {
 
-enum class Codec : std::uint8_t { kH264 = 1, kH265 = 2, kMJPEG = 3 };
+enum class Codec : std::uint8_t { kH264 = 1, kH265 = 2, kMJPEG = 3, kOpus = 4 };
 
 struct Identity {
   std::string extension_id;
@@ -77,12 +77,14 @@ private:
 class MediaSubscription {
 public:
   using FrameCallback = std::function<void(std::vector<NalPacket>)>;
+  using AudioCallback = std::function<void(NalPacket)>;
   using NotifyCallback = std::function<void()>;
   using FatalCallback = std::function<void(std::string)>;
 
   MediaSubscription(std::string socket_path, Identity identity,
                     VideoProfile profile,
                     FrameCallback frame_callback,
+                    AudioCallback audio_callback,
                     NotifyCallback notify_callback,
                     FatalCallback fatal_callback);
   ~MediaSubscription();
@@ -100,6 +102,7 @@ private:
   Identity identity_;
   VideoProfile profile_;
   FrameCallback frame_callback_;
+  AudioCallback audio_callback_;
   NotifyCallback notify_callback_;
   FatalCallback fatal_callback_;
   std::atomic<bool> stopping_{false};

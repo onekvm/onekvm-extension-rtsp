@@ -105,8 +105,12 @@ func run(args []string) error {
 		ExtensionID: identity.ExtensionID,
 		Token:       identity.Token,
 		Video:       "encoded",
+		Audio:       "opus",
 		FPS:         cfg.FPS,
 		Consume: func(frame protocolipc.Frame) error {
+			if frame.Codec == "opus" {
+				return sink.WriteAudio(frame.Payload, float64(frame.DurationUS)/1_000_000)
+			}
 			if frame.Codec != cfg.Codec {
 				return fmt.Errorf("%w from %s to %s", errCodecChanged, cfg.Codec, frame.Codec)
 			}
