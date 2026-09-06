@@ -12,7 +12,7 @@
 
 namespace {
 
-char volatile exit_flag = 0;
+EventLoopWatchVariable exit_flag{0};
 
 void HandleSignal(int) { exit_flag = 1; }
 
