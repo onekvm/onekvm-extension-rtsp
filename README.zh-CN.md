@@ -22,9 +22,16 @@
 安装，然后使用插件管理器控制扩展：
 
 ```sh
-onekvm-plugin-manager enable rtsp
-onekvm-plugin-manager disable rtsp
+onekvm-extension enable rtsp
+onekvm-extension disable rtsp
 ```
+
+启用后使用 systemd socket activation（`Accept=no`）：空闲时只保留监听
+Socket，首个 TCP 连接触发协议进程启动。全部客户端离开后，进程空闲 30 秒
+退出，下次连接自动重新唤醒。RTSP 还会等待 UDP 媒体会话结束或超时。
+禁用扩展会关闭监听并断开客户端；修改监听地址或端口会重建 Socket。
+监听地址使用 IPv4 或 IPv6 数字地址。此功能需要支持 `socket_activation`
+的扩展宿主；未继承 systemd Socket 时手工运行仍采用常驻服务模式。
 
 ## 配置与连接
 

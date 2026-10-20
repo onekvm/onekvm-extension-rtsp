@@ -23,6 +23,7 @@ struct VideoInfo {
   std::uint16_t width = 0;
   std::uint16_t height = 0;
   std::uint32_t duration_us = 0;
+  bool audio_available = true;
 };
 
 struct VideoProfile {
@@ -82,7 +83,7 @@ public:
   using FatalCallback = std::function<void(std::string)>;
 
   MediaSubscription(std::string socket_path, Identity identity,
-                    VideoProfile profile,
+                    VideoProfile profile, bool audio_enabled,
                     FrameCallback frame_callback,
                     AudioCallback audio_callback,
                     NotifyCallback notify_callback,
@@ -101,6 +102,7 @@ private:
   std::string socket_path_;
   Identity identity_;
   VideoProfile profile_;
+  bool audio_enabled_;
   FrameCallback frame_callback_;
   AudioCallback audio_callback_;
   NotifyCallback notify_callback_;

@@ -1,4 +1,5 @@
 #include "rtsp_server.hpp"
+#include "socket_activation.hpp"
 
 #include <BasicUsageEnvironment.hh>
 #include <GroupsockHelper.hh>
@@ -101,10 +102,9 @@ public:
   static BoundRTSPServer *Create(UsageEnvironment &env, const Config &config,
                                  const Identity &identity, Codec codec,
                                  UserAuthenticationDatabase *auth,
-                                 std::string &error) {
-    int family = AF_UNSPEC;
-    const int socket_fd = CreateListenSocket(config.listen_address, config.port,
-                                             family, error);
+                                 std::string &error, int listen_fd, int family) {
+    const int socket_fd = listen_fd >= 0 ? listen_fd :
+        CreateListenSocket(config.listen_address, config.port, family, error);
     if (socket_fd < 0)
       return nullptr;
     Port server_port(static_cast<portNumBits>(config.port));
@@ -116,6 +116,11 @@ public:
   const Config &ServerConfig() const { return config_; }
   const Identity &ServerIdentity() const { return identity_; }
   Codec ServerCodec() const { return codec_; }
+  bool HasClients() const {
+    // UDP playback can outlive its RTSP control connection. Keep the process
+    // until LIVE555 has reclaimed both control connections and media sessions.
+    return fClientConnections->numEntries() != 0 || numClientSessions() != 0;
+  }
 
 private:
   BoundRTSPServer(UsageEnvironment &env, int ipv4_socket, int ipv6_socket,
@@ -210,13 +215,14 @@ BoundRTSPServer::createNewClientSession(u_int32_t session_id) {
 class EncodedHub {
 public:
   EncodedHub(const Config &config, const Identity &identity, Codec codec,
+             bool audio_available,
              std::atomic<bool> &fatal, std::string &fatal_error)
       : fatal_(fatal), fatal_error_(fatal_error) {
     const VideoProfile profile{codec, config.fps, config.quality_factor,
                                config.bitrate_kbps, config.initial_qp,
                                config.min_qp, config.max_qp, config.gop};
     subscription_ = std::make_unique<MediaSubscription>(
-        config.media_socket, identity, profile,
+        config.media_socket, identity, profile, audio_available,
         [this](std::vector<NalPacket> packets) { EnqueueVideo(std::move(packets)); },
         [this](NalPacket packet) { EnqueueAudio(std::move(packet)); },
         [this]() { Notify(); },
@@ -636,9 +642,30 @@ private:
 
 } // namespace
 
+namespace {
+struct IdleMonitor {
+  BoundRTSPServer &server;
+  EventLoopWatchVariable &exit_flag;
+  onekvm::activation::IdleTimeout timeout;
+  TaskToken task = nullptr;
+  static void Check(void *data) {
+    auto &self = *static_cast<IdleMonitor *>(data);
+    if (self.timeout.Expired(self.server.HasClients())) {
+      self.server.envir() << "onekvm-protocol-rtsp: idle for 30 seconds; returning listener to systemd\n";
+      self.exit_flag = 1;
+      self.task = nullptr;
+    } else {
+      self.task = self.server.envir().taskScheduler().scheduleDelayedTask(1000000, Check, data);
+    }
+  }
+};
+} // namespace
+
 bool RunRTSPServer(const Config &config, const Identity &identity, Codec codec,
+                   bool audio_available,
                    EventLoopWatchVariable &exit_flag, std::atomic<bool> &fatal,
-                   std::string &fatal_error, std::string &error) {
+                   std::string &fatal_error, std::string &error,
+                   int listen_fd, int listen_family) {
   auto *scheduler = BasicTaskScheduler::createNew();
   if (scheduler == nullptr) {
     error = "create LIVE555 task scheduler";
@@ -657,7 +684,7 @@ bool RunRTSPServer(const Config &config, const Identity &identity, Codec codec,
     auth->addUserRecord(config.username.c_str(), config.password.c_str());
   }
   auto *server = BoundRTSPServer::Create(*environment, config, identity, codec,
-                                         auth.get(), error);
+                                         auth.get(), error, listen_fd, listen_family);
   if (server == nullptr) {
     environment->reclaim();
     delete scheduler;
@@ -667,16 +694,21 @@ bool RunRTSPServer(const Config &config, const Identity &identity, Codec codec,
   std::string stream_name = config.path;
   while (!stream_name.empty() && stream_name.front() == '/')
     stream_name.erase(0, 1);
-  EncodedHub hub(config, identity, codec, fatal, fatal_error);
+  EncodedHub hub(config, identity, codec, audio_available, fatal, fatal_error);
   auto *session =
       ServerMediaSession::createNew(*environment, stream_name.c_str(),
                                     stream_name.c_str(), "OneKVM");
   session->addSubsession(OneKVMSubsession::Create(*environment, codec, hub));
-  session->addSubsession(OneKVMAudioSubsession::Create(*environment, hub));
+  if (audio_available)
+    session->addSubsession(OneKVMAudioSubsession::Create(*environment, hub));
   server->addServerMediaSession(session);
   OutPacketBuffer::maxSize = 2U << 20;
 
+  IdleMonitor idle{*server, exit_flag, onekvm::activation::IdleTimeout{}};
+  if (listen_fd >= 0)
+    idle.task = scheduler->scheduleDelayedTask(1000000, IdleMonitor::Check, &idle);
   environment->taskScheduler().doEventLoop(&exit_flag);
+  scheduler->unscheduleDelayedTask(idle.task);
   Medium::close(server);
   environment->reclaim();
   delete scheduler;

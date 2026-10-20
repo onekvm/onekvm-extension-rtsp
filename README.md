@@ -25,9 +25,20 @@ The package name is `onekvm-extension-rtsp`. Install it through your OneKVM
 distribution package or image, then manage it with the plugin manager:
 
 ```sh
-onekvm-plugin-manager enable rtsp
-onekvm-plugin-manager disable rtsp
+onekvm-extension enable rtsp
+onekvm-extension disable rtsp
 ```
+
+An enabled extension uses systemd socket activation (`Accept=no`). Only the
+listener remains while idle; the first TCP connection starts the protocol
+process with systemd's listening socket. After all clients leave, the process
+exits following 30 seconds of idle time and the next connection starts it
+again. RTSP also waits for UDP media sessions to end or expire. Disabling the
+extension closes the listener and terminates its clients; changes to the bind
+address or port recreate the socket. Bind addresses must be numeric IPv4 or
+IPv6 addresses. This requires an Extension Host with `socket_activation`
+support; manual execution without an inherited socket retains the normal
+resident-server behavior.
 
 ## Configure and connect
 

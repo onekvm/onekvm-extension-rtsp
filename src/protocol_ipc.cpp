@@ -37,6 +37,8 @@ constexpr std::uint32_t kRingSlotHeaderSize = 64;
 constexpr std::uint32_t kRingStateFree = 0;
 constexpr std::uint32_t kRingStateReady = 2;
 constexpr std::uint32_t kRingStateReading = 3;
+constexpr std::uint8_t kInfoFlagAudioAvailable = 1U << 0U;
+constexpr std::uint8_t kInfoFlagValid = 1U << 7U;
 
 struct Frame {
   std::uint64_t sequence = 0;
@@ -45,6 +47,7 @@ struct Frame {
   std::uint16_t width;
   std::uint16_t height;
   bool keyframe;
+  bool audio_available = true;
   std::shared_ptr<void> owner;
   const std::uint8_t *data = nullptr;
   std::size_t size = 0;
@@ -187,7 +190,8 @@ int ConnectUnix(const std::string &path, int timeout_ms, std::string &error) {
 std::string SubscriptionJSON(const Identity &identity, std::string_view video,
                              const VideoProfile *profile = nullptr,
                              bool shared_ring = false,
-                             bool track_session = true) {
+                             bool track_session = true,
+                             bool audio_enabled = false) {
   std::string request =
       "{\"version\":1,\"extension_id\":\"" + identity.extension_id +
       "\",\"token\":\"" + identity.token + "\",\"video\":\"" +
@@ -211,7 +215,7 @@ std::string SubscriptionJSON(const Identity &identity, std::string_view video,
         request += ",\"gop\":" + std::to_string(profile->gop);
     }
   }
-  if (video == "encoded")
+  if (video == "encoded" && audio_enabled)
     request += ",\"audio\":\"opus\"";
   if (shared_ring)
     request += ",\"transport\":\"shm-ring-v1\"";
@@ -406,8 +410,8 @@ Frame TakeNextFrame(const std::shared_ptr<RingMapping> &ring) {
     lease->ring = ring;
     lease->state = selected_state;
     return Frame{ReadLE64(header + 8), codec, ReadLE32(header + 24), width,
-                 height, header[33] != 0, lease, header + kRingSlotHeaderSize,
-                 payload_size};
+                 height, header[33] != 0, true, lease,
+                 header + kRingSlotHeaderSize, payload_size};
   }
   return {};
 }
@@ -434,6 +438,8 @@ bool ReadFrame(int fd, Frame &frame, std::string &error) {
   frame.width = ReadBE16(header.data() + 28);
   frame.height = ReadBE16(header.data() + 30);
   frame.keyframe = (header[6] & 1U) != 0;
+  frame.audio_available = (header[7] & kInfoFlagValid) == 0 ||
+                          (header[7] & kInfoFlagAudioAvailable) != 0;
   auto payload = std::make_shared<std::vector<std::uint8_t>>(length);
   frame.owner = payload;
   frame.data = payload->data();
@@ -504,7 +510,8 @@ bool QueryVideoInfo(const std::string &socket_path, const Identity &identity,
     error = "invalid protocol video metadata";
     return false;
   }
-  info = VideoInfo{frame.codec, frame.width, frame.height, frame.duration_us};
+  info = VideoInfo{frame.codec, frame.width, frame.height, frame.duration_us,
+                   frame.audio_available};
   return true;
 }
 
@@ -596,13 +603,14 @@ SessionReporter::~SessionReporter() {
 }
 
 MediaSubscription::MediaSubscription(std::string socket_path, Identity identity,
-                                     VideoProfile profile,
+                                     VideoProfile profile, bool audio_enabled,
                                      FrameCallback frame_callback,
                                      AudioCallback audio_callback,
                                      NotifyCallback notify_callback,
                                      FatalCallback fatal_callback)
     : socket_path_(std::move(socket_path)), identity_(std::move(identity)),
-      profile_(profile), frame_callback_(std::move(frame_callback)),
+      profile_(profile), audio_enabled_(audio_enabled),
+      frame_callback_(std::move(frame_callback)),
       audio_callback_(std::move(audio_callback)),
       notify_callback_(std::move(notify_callback)),
       fatal_callback_(std::move(fatal_callback)) {}
@@ -648,7 +656,8 @@ void MediaSubscription::Run() {
     socket_fd_.store(fd);
     const bool request_shared_ring = shared_ring_supported;
     if (!WriteAll(fd, SubscriptionJSON(identity_, "encoded", &profile_,
-                                        request_shared_ring, false),
+                                        request_shared_ring, false,
+                                        audio_enabled_),
                   error)) {
       CloseOwnedSocket(socket_fd_, fd);
       continue;

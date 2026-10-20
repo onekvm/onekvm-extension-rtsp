@@ -22,6 +22,7 @@
   "author": "OneKVM",
   "homepage": "https://github.com/onekvm/onekvm-extension-rtsp",
   "entrypoint": "bin/onekvm-protocol-rtsp",
+  "socket_activation": {"address_setting": "listen_address", "port_setting": "port"},
   "permissions": ["network"],
   "capabilities": ["video.encoded"],
   "video": {"settings": "all", "mode_select": ["h264", "h265"]},

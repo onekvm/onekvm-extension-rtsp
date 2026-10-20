@@ -1,14 +1,18 @@
 #include "config.hpp"
+#include "socket_activation.hpp"
 #include "protocol_ipc.hpp"
 #include "rtsp_server.hpp"
 
 #include <signal.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <unistd.h>
 
 namespace {
 
@@ -66,6 +70,21 @@ int Run(int argc, char **argv) {
   if (options.health || !options.lifecycle.empty() || !config.service_enabled)
     return 0;
 
+  int listen_fd = -1, listen_family = AF_UNSPEC;
+  if (!onekvm::activation::TakeListener(listen_fd, listen_family, error)) {
+    std::cerr << "socket activation: " << error << '\n';
+    return 1;
+  }
+  if (listen_fd >= 0) {
+    bool pending = false;
+    if (!onekvm::activation::CheckPendingConnection(listen_fd, pending, error)) {
+      std::cerr << "socket activation: " << error << '\n';
+      return 1;
+    }
+    if (!pending)
+      return 0;
+  }
+
   onekvm::rtsp::Identity identity;
   if (!onekvm::rtsp::LoadIdentity(identity, error)) {
     std::cerr << "onekvm-protocol-rtsp: " << error << '\n';
@@ -96,9 +115,36 @@ int Run(int argc, char **argv) {
   }
 
   std::atomic<bool> fatal{false};
+  std::atomic<bool> capability_monitor_stop{false};
+  std::atomic<bool> audio_capability_changed{false};
   std::string fatal_error;
-  if (!onekvm::rtsp::RunRTSPServer(config, identity, codec, exit_flag,
-                                   fatal, fatal_error, error)) {
+  std::thread capability_monitor([&] {
+    while (!capability_monitor_stop.load()) {
+      for (int step = 0; step < 10 && !capability_monitor_stop.load(); ++step)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      if (capability_monitor_stop.load())
+        return;
+      onekvm::rtsp::VideoInfo current;
+      std::string query_error;
+      if (onekvm::rtsp::QueryVideoInfo(config.media_socket, identity, codec,
+                                       current, query_error) &&
+          current.audio_available != info.audio_available) {
+        audio_capability_changed.store(true);
+        kill(getpid(), SIGTERM);
+        return;
+      }
+    }
+  });
+  const bool ran = onekvm::rtsp::RunRTSPServer(
+      config, identity, codec, info.audio_available, exit_flag, fatal,
+      fatal_error, error, listen_fd, listen_family);
+  capability_monitor_stop.store(true);
+  capability_monitor.join();
+  if (audio_capability_changed.load()) {
+    std::cerr << "onekvm-protocol-rtsp: USB audio capability changed; restarting\n";
+    return 1;
+  }
+  if (!ran) {
     std::cerr << "onekvm-protocol-rtsp: "
               << (fatal_error.empty() ? error : fatal_error) << '\n';
     return 1;
