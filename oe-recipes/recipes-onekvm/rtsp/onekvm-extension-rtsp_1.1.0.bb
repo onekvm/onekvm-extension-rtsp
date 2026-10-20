@@ -2,7 +2,7 @@ SUMMARY = "OneKVM RTSP protocol extension"
 HOMEPAGE = "https://github.com/onekvm/onekvm-extension-rtsp"
 LICENSE = "GPL-3.0-only"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=1ebbd3e34237af26da5dc08a4e440464"
-PR = "r2"
+PR = "r3"
 
 ONEKVM_COMPONENT_GIT_URI ??= "git://github.com/onekvm/onekvm-extension-rtsp.git;protocol=https;branch=main"
 ONEKVM_COMPONENT_SRCREV ??= ""
